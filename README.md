@@ -1,7 +1,7 @@
 # sshhole-remediate
 
-[![lint](https://img.shields.io/github/actions/workflow/status/mlazzarotto/ansible-sshole_remediate/lint.yml?branch=main)](https://github.com/mlazzarotto/ansible-sshole_remediate/actions/workflows/lint.yml)
-[![license](https://img.shields.io/github/license/mlazzarotto/ansible-sshole_remediate)](https://github.com/mlazzarotto/ansible-sshole_remediate/blob/main/LICENSE)
+[![lint](https://img.shields.io/github/actions/workflow/status/mlazzarotto/ansible-sshole_remediate/lint.yml?branch=main&label=lint)](https://github.com/mlazzarotto/ansible-sshole_remediate/actions/workflows/lint.yml)
+[![license](https://img.shields.io/github/license/mlazzarotto/ansible-sshole_remediate?v=1)](https://github.com/mlazzarotto/ansible-sshole_remediate/blob/main/LICENSE)
 [![tag](https://img.shields.io/github/v/tag/mlazzarotto/ansible-sshole_remediate)](https://github.com/mlazzarotto/ansible-sshole_remediate/tags)
 [![last commit](https://img.shields.io/github/last-commit/mlazzarotto/ansible-sshole_remediate)](https://github.com/mlazzarotto/ansible-sshole_remediate/commits/main)
 ![Alpine](https://img.shields.io/badge/platform-Alpine-0D597F?logo=alpinelinux&logoColor=white)
