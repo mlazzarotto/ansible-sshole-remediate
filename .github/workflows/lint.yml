@@ -1,0 +1,28 @@
+---
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ansible-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install ansible-core and ansible-lint
+        run: pip install ansible-core ansible-lint
+
+      - name: Run ansible-lint
+        run: ansible-lint

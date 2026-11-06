@@ -1,0 +1,444 @@
+---
+# CVE-2026-123158 ("sshhole"): on musl libc without PAM, sshd accepts any
+# password longer than 256 bytes for accounts whose hash is "*". Fixed in
+# OpenSSH 10.6p2.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini sshhole-remediate.yml -e mode=openssh
+#   ansible-playbook -i inventory.ini sshhole-remediate.yml -e mode=full
+#
+#   mode=openssh : upgrade the openssh packages from edge and leave the rest
+#                  of /etc/apk/repositories on the stable branch
+#   mode=full    : switch every repository to edge and upgrade the system
+#
+# Both modes run the detection script before and after the upgrade and fail
+# if the host is still exposed.
+#
+# The detection script is not vendored. It is downloaded from sshole_script_url
+# at run time. Set sshole_sha256 to pin it.
+#
+# Python 3 is used on the targets. The first play installs it when missing;
+# set sshole_bootstrap_python=false to manage it yourself.
+
+- name: Preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Assert that the alpine group is not empty
+      ansible.builtin.assert:
+        that: groups['alpine'] | default([]) | length > 0
+        fail_msg: "no hosts in the 'alpine' group, see inventory.example.ini"
+        quiet: true
+
+- name: Ensure python3 on the targets
+  hosts: alpine
+  gather_facts: false
+  become: true
+
+  vars:
+    sshole_bootstrap_python: true
+
+  tasks:
+    - name: Install python3 when missing
+      ansible.builtin.raw: |
+        if [ ! -f /etc/alpine-release ]; then
+          echo "not Alpine Linux, refusing to continue"
+          exit 1
+        fi
+        if command -v python3 >/dev/null 2>&1; then
+          echo present
+        else
+          apk add --no-cache python3 >/dev/null && echo installed
+        fi
+      register: python3_bootstrap
+      changed_when: "'installed' in python3_bootstrap.stdout"
+      when: sshole_bootstrap_python | bool
+
+- name: Remediate the OpenSSH musl password bypass
+  hosts: alpine
+  become: true
+  gather_facts: true
+
+  vars:
+    mode: openssh
+    alpine_branch: edge
+    edge_repo: https://dl-cdn.alpinelinux.org/alpine/edge/main
+    openssh_min_version: "10.6_p2"
+    sshole_script_url: https://raw.githubusercontent.com/oz9un/sshole/main/check.sh
+    sshole_sha256: ""
+    alpine_reboot: false
+    # Autodiscovery caches /usr/bin/python3.X, which an edge upgrade replaces.
+    # The symlink stays valid across the upgrade.
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Validate the requested mode
+      ansible.builtin.assert:
+        that: mode in ['openssh', 'full']
+        fail_msg: "mode must be 'openssh' or 'full', got '{{ mode }}'"
+        quiet: true
+      run_once: true
+
+    - name: Validate the target
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == 'Alpine'
+          - ansible_facts.distribution_version is version('3.16', '>=')
+        fail_msg: >-
+          {{ inventory_hostname }} runs
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }},
+          this play needs Alpine 3.16 or newer
+        quiet: true
+
+    # The script runs as root on every target, so fetch it on the controller
+    # and check it before it is executed. The temporary directory is removed
+    # at the end of the play.
+    - name: Create a temporary directory on the controller
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: sshole-
+      delegate_to: localhost
+      run_once: true
+      become: false
+      check_mode: false
+      changed_when: false
+      register: sshole_tmp
+
+    - name: Download the detection script
+      ansible.builtin.get_url:
+        url: "{{ sshole_script_url }}"
+        dest: "{{ sshole_tmp.path }}/check.sh"
+        mode: "0755"
+        force: true
+        checksum: "{{ ('sha256:' ~ sshole_sha256) if sshole_sha256 | length > 0 else omit }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      check_mode: false
+      changed_when: false
+      register: sshole_download
+
+    - name: Assert that the detection script looks like a shell script
+      ansible.builtin.assert:
+        that: sshole_download.dest is defined
+        fail_msg: "could not download {{ sshole_script_url }}"
+        quiet: true
+
+    - name: List the installed packages
+      ansible.builtin.command:
+        cmd: apk list -I
+      changed_when: false
+      register: installed_packages
+
+    - name: Select the installed openssh versions
+      ansible.builtin.set_fact:
+        # flatten(levels=1) turns [[name, version], ...] into pairs; dict()
+        # needs the pairs, not the scalars.
+        openssh_versions: >-
+          {{ dict(installed_packages.stdout_lines
+                  | map('regex_findall', '^(openssh[^ ]*)-([0-9][^-]*-r[0-9]+)\s')
+                  | list | flatten(levels=1)) }}
+
+    - name: Select the installed openssh packages
+      ansible.builtin.set_fact:
+        openssh_packages: "{{ openssh_versions.keys() | sort }}"
+
+    - name: Read the sshd init configuration
+      ansible.builtin.slurp:
+        src: /etc/conf.d/sshd
+      register: sshd_conf
+      failed_when: false
+
+    - name: Read the sshd flavor
+      ansible.builtin.set_fact:
+        sshd_flavor: >-
+          {{ (sshd_conf.content | default('') | b64decode
+              | regex_search('(?m)^sshd_flavor=\W*([a-z]+)', '\1'))
+             | default('', true) }}
+
+    - name: Look for the sshd binary
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: >-
+        {{ (['/usr/sbin/sshd.' ~ sshd_flavor] if sshd_flavor | length > 0 else [])
+           + ['/usr/sbin/sshd', '/usr/sbin/sshd.pam', '/usr/local/sbin/sshd'] }}
+      register: sshd_paths
+
+    - name: Pick the sshd binary
+      ansible.builtin.set_fact:
+        sshd_bin: "{{ sshd_paths.results | selectattr('stat.exists') | map(attribute='item') | first | default('', true) }}"
+
+    - name: Current state
+      ansible.builtin.debug:
+        msg:
+          - "release: {{ ansible_facts.distribution_version }}"
+          - "sshd: {{ sshd_bin | default('none', true) }}"
+          - "openssh: {{ openssh_packages | join(', ') }}"
+
+    - name: Check the current exposure
+      ansible.builtin.script: "{{ sshole_tmp.path }}/check.sh"
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      register: hole_pre
+
+    - name: Assert the pre check returned a known exit code
+      ansible.builtin.assert:
+        that: hole_pre.rc | default(-1) in [0, 1, 2]
+        fail_msg: >-
+          the detection script failed on {{ inventory_hostname }}
+          (rc={{ hole_pre.rc | default('none') }}):
+          {{ hole_pre.stderr | default('no stderr') | trim }}
+        quiet: true
+
+    - name: Current exposure
+      ansible.builtin.debug:
+        msg: "{{ hole_pre.stdout_lines | default(['no output']) }}"
+
+    - name: Fail when sshd is present but no openssh package was detected
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} has sshd at {{ sshd_bin }}
+          but no openssh package showed up in apk list.
+          Parsing failed, refusing to continue.
+      when:
+        - openssh_packages | length == 0
+        - sshd_bin | length > 0
+
+    - name: Nothing to remediate
+      ansible.builtin.meta: end_host
+      when: openssh_packages | length == 0
+
+    # --- package sources ---------------------------------------------------
+    - name: Pin the edge repository
+      ansible.builtin.lineinfile:
+        path: /etc/apk/repositories
+        regexp: '^@edge\s+'
+        line: "@edge {{ edge_repo }}"
+        state: present
+      when: mode == 'openssh'
+
+    - name: Back up /etc/apk/repositories
+      ansible.builtin.copy:
+        src: /etc/apk/repositories
+        dest: /etc/apk/repositories.pre-edge
+        remote_src: true
+        force: false
+        mode: preserve
+      when: mode == 'full'
+
+    - name: Switch the repositories to {{ alpine_branch }}
+      ansible.builtin.replace:
+        path: /etc/apk/repositories
+        regexp: '(?m)^((?!\s*#).*?/alpine)/(v\d+\.\d+|latest-stable)(/|$)'
+        replace: '\1/{{ alpine_branch }}\3'
+      when: mode == 'full'
+
+    - name: Read the repository list
+      ansible.builtin.slurp:
+        src: /etc/apk/repositories
+      register: repositories
+      when: mode == 'full'
+
+    - name: List any versioned repositories
+      ansible.builtin.set_fact:
+        versioned_repos: >-
+          {{ (repositories.content | b64decode).splitlines()
+             | reject('match', '^\s*#')
+             | select('search', '/(v\d+\.\d+|latest-stable)(/|$)')
+             | list }}
+      when: mode == 'full'
+
+    - name: Assert that no versioned repositories remain
+      ansible.builtin.assert:
+        that: versioned_repos | length == 0
+        fail_msg: "still versioned: {{ versioned_repos | join(', ') }}"
+      when: mode == 'full'
+
+    - name: Refresh the package index
+      ansible.builtin.command:
+        cmd: apk update
+      changed_when: false
+
+    # The upgrade and the restart are one task on purpose. Once apk replaces
+    # the sshd binaries the running listener can no longer fork new sessions,
+    # so a separate task would fail before it could restart the service.
+    # The script also proves that the listener runs the upgraded binary.
+    - name: Upgrade the packages and restart sshd
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          set -o pipefail
+          result=unchanged
+          if [ "{{ mode }}" = 'full' ]; then
+            out=$(apk upgrade --available 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          else
+            out=$(apk add --upgrade {{ openssh_packages | map('regex_replace', '$', '@edge') | join(' ') }} 2>&1) \
+              || { printf '%s\n' "$out"; exit 1; }
+          fi
+          printf '%s\n' "$out"
+          case "$out" in *Upgrading*) result=changed ;; esac
+
+          # 10.6 adds an ML-DSA host key, which must exist before the restart.
+          if command -v ssh-keygen >/dev/null 2>&1; then
+            keys=$(ssh-keygen -A 2>&1 || true)
+            if [ -n "$keys" ]; then
+              printf '%s\n' "$keys"
+              result=changed
+            fi
+          fi
+
+          sshd='{{ sshd_bin }}'
+          if [ -n "$sshd" ]; then
+            "$sshd" -t || { echo "sshd -t failed, the service was not restarted"; exit 1; }
+            current=$(readlink -f "$sshd")
+            pidfile=$("$sshd" -T 2>/dev/null | awk '$1=="pidfile"{p=$2} END{if (p) print p}')
+            [ -n "$pidfile" ] || pidfile=/run/sshd.pid
+
+            listener=''
+            pid=$(cat "$pidfile" 2>/dev/null || true)
+            if [ -n "$pid" ] && [ -e "/proc/$pid/exe" ]; then
+              listener=$(readlink "/proc/$pid/exe")
+            fi
+            if [ -n "$listener" ] && [ "$listener" != "$current" ]; then
+              echo "sshd is running $listener, restarting to pick up $current"
+              result=changed
+            fi
+
+            if [ "$result" = changed ]; then
+              if command -v rc-service >/dev/null 2>&1; then
+                rc-service sshd restart || rc-service sshd start
+              else
+                echo "sshd must be restarted but rc-service is missing"
+                exit 1
+              fi
+              rc-service sshd status >/dev/null 2>&1 \
+                || { echo "sshd is not running after the restart"; exit 1; }
+              pid=$(cat "$pidfile" 2>/dev/null || true)
+              if [ -n "$pid" ] && [ -e "/proc/$pid/exe" ]; then
+                listener=$(readlink "/proc/$pid/exe")
+                if [ "$listener" != "$current" ]; then
+                  echo "the listener still runs $listener"
+                  exit 1
+                fi
+              else
+                echo "cannot read the listener pid from $pidfile"
+                exit 1
+              fi
+            fi
+          fi
+          echo "result=$result"
+      register: upgrade_run
+      changed_when: "'result=changed' in upgrade_run.stdout"
+
+    # --- verification ------------------------------------------------------
+    - name: List the installed packages again
+      ansible.builtin.command:
+        cmd: apk list -I
+      changed_when: false
+      register: installed_after
+      when: not ansible_check_mode
+
+    - name: Select the installed openssh versions again
+      ansible.builtin.set_fact:
+        openssh_versions_after: >-
+          {{ dict(installed_after.stdout_lines
+                  | map('regex_findall', '^(openssh[^ ]*)-([0-9][^-]*-r[0-9]+)\s')
+                  | list | flatten(levels=1)) }}
+      when: not ansible_check_mode
+
+    - name: Select the installed openssh packages again
+      ansible.builtin.set_fact:
+        openssh_packages_after: "{{ openssh_versions_after.keys() | sort }}"
+      when: not ansible_check_mode
+
+    - name: Assert that openssh is still installed
+      ansible.builtin.assert:
+        that: openssh_packages_after | length > 0
+        fail_msg: "no openssh package found after the upgrade"
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Compare every openssh package against {{ openssh_min_version }}
+      ansible.builtin.command:
+        argv:
+          - apk
+          - version
+          - -t
+          - "{{ openssh_versions_after[item] }}"
+          - "{{ openssh_min_version }}"
+      loop: "{{ openssh_packages_after }}"
+      register: version_check
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Assert the installed openssh versions
+      ansible.builtin.assert:
+        that:
+          - version_check.results | rejectattr('stdout', 'search', '^[=>]$') | list | length == 0
+        fail_msg: >-
+          below {{ openssh_min_version }}:
+          {{ version_check.results | rejectattr('stdout', 'search', '^[=>]$')
+             | map(attribute='item') | join(', ') }}
+      when: not ansible_check_mode
+
+    # --- post check --------------------------------------------------------
+    - name: Check the exposure after the remediation
+      ansible.builtin.script: "{{ sshole_tmp.path }}/check.sh"
+      changed_when: false
+      failed_when: false
+      register: hole_post
+      when: not ansible_check_mode
+
+    - name: Assert the post check returned a known exit code
+      ansible.builtin.assert:
+        that: hole_post.rc | default(-1) in [0, 1, 2]
+        fail_msg: >-
+          the detection script failed on {{ inventory_hostname }}
+          (rc={{ hole_post.rc | default('none') }}):
+          {{ hole_post.stderr | default('no stderr') | trim }}
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Fail when the host is still exposed
+      ansible.builtin.fail:
+        msg: |-
+          {{ inventory_hostname }} is still exposed after the upgrade (rc={{ hole_post.rc }}).
+          {{ hole_post.stdout | default('no output') | trim }}
+          Fallback: set 'PasswordAuthentication no' and restart sshd.
+      when:
+        - not ansible_check_mode
+        - hole_post.rc | default(-1) == 0
+
+    - name: Warn about an incomplete post check
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: check inconclusive (rc=2), treat as
+          'probably': {{ hole_post.stdout_lines | default(['']) | last | default('') }}
+      when:
+        - not ansible_check_mode
+        - hole_post.rc | default(-1) == 2
+
+    - name: Post remediation result
+      ansible.builtin.debug:
+        msg: "{{ hole_post.stdout_lines | default(['no output']) | last | default('no output') }}"
+      when:
+        - not ansible_check_mode
+        - hole_post.rc | default(-1) == 1
+
+    - name: Reboot the host
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when: alpine_reboot | bool
+
+    - name: Remove the temporary directory on the controller
+      ansible.builtin.file:
+        path: "{{ sshole_tmp.path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      become: false
+      changed_when: false

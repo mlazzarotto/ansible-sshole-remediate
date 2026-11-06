@@ -1,0 +1,6 @@
+.ansible/
+.opencode/
+inventory.ini
+*.retry
+*.log
+.DS_Store
